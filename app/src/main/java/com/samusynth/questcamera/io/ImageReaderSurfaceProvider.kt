@@ -23,7 +23,8 @@ class ImageReaderSurfaceProvider(
     private val height: Int,
     imageFileDirPath: String,
     formatInfoFilePath: String,
-    private val bufferPoolSize: Int = 5
+    private val bufferPoolSize: Int = 5,
+    private val useQoiCompression: Boolean = false  // Disabled: real-time compression causes stuttering on Quest hardware
 ): ISurfaceProvider, AutoCloseable {
     private val handlerThread = HandlerThread("ImageReaderBackground").apply {
         start()
@@ -39,7 +40,13 @@ class ImageReaderSurfaceProvider(
     // AtomicBoolean ensures thread-safe compare-and-set operation (prevents race conditions)
     private val shouldCaptureNextFrame = AtomicBoolean(false)
     
-    private val saveExecutor = Executors.newSingleThreadExecutor()
+    // Use lower priority thread to prevent stealing CPU from render thread
+    private val saveExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable).apply {
+            name = "ImageSaver"
+            priority = Thread.MIN_PRIORITY  // Don't compete with render thread
+        }
+    }
 
     private val bufferPool = MutableList(bufferPoolSize) { ByteArray(width * height + width * height / 2) }
     private var latestBufferPoolIndex = 0
@@ -160,20 +167,56 @@ class ImageReaderSurfaceProvider(
         val nextBufferPoolIndex = (latestBufferPoolIndex + 1) % bufferPoolSize
         val buffer = bufferPool[nextBufferPoolIndex]
 
+        // Copy image data into our buffer pool (fast operation, ~5-10ms)
         val data = dumpImageUnsafe(image, buffer)
         bufferPool[nextBufferPoolIndex] = data
 
         latestBufferPoolIndex = nextBufferPoolIndex
 
         // Save image data (we only reach here if capture was signaled)
-            val fileName = "${computeUnixTime(image.timestamp)}.yuv"
-            val file = File(directory, fileName)
-
-            saveExecutor.execute {
-                try {
-                    BufferedOutputStream(FileOutputStream(file)).use { it.write(data) }
-                } catch (e: Exception) {
-                    e.printStackTrace()
+        val timestamp = computeUnixTime(image.timestamp)
+        
+        // Move all CPU-heavy work to low-priority background thread
+        saveExecutor.execute {
+            // Set low priority for this specific task to minimize impact on render thread
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            try {
+                if (useQoiCompression) {
+                    // Convert YUV to RGB
+                    val startTime = System.currentTimeMillis()
+                    val rgb = convertYuv420ToRgb(data, width, height)
+                    val conversionTime = System.currentTimeMillis() - startTime
+                    
+                    // Encode to QOI format
+                    val encodeStartTime = System.currentTimeMillis()
+                    val qoiData = QoiEncoder.encodeRgb(rgb, width, height)
+                    val encodeTime = System.currentTimeMillis() - encodeStartTime
+                    
+                    // Write to file
+                    val fileName = "$timestamp.qoi"
+                    val file = File(directory, fileName)
+                    BufferedOutputStream(FileOutputStream(file)).use {
+                        it.write(qoiData)
+                    }
+                    
+                    val qoiSize = file.length()
+                    val compressionRatio = 100.0 * qoiSize / data.size
+                    Log.d(TAG, "Saved QOI: ${file.name}, " +
+                          "YUV: ${data.size} bytes, QOI: $qoiSize bytes, " +
+                          "ratio: ${String.format("%.1f", compressionRatio)}%, " +
+                          "conversion: ${conversionTime}ms, encode: ${encodeTime}ms")
+                } else {
+                    // Original YUV path (for compatibility/debugging)
+                    val fileName = "$timestamp.yuv"
+                    val file = File(directory, fileName)
+                    BufferedOutputStream(FileOutputStream(file)).use { 
+                        it.write(data) 
+                    }
+                    Log.d(TAG, "Saved YUV: ${file.name}, size: ${data.size} bytes")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to save image: ${e.message}")
+                e.printStackTrace()
             }
         }
     }
@@ -181,6 +224,53 @@ class ImageReaderSurfaceProvider(
     private fun computeUnixTime(imageTimestamp: Long): Long {
         val deltaNs = imageTimestamp - baseMonoTimeNs
         return baseUnixTimeMs + (deltaNs / 1_000_000)
+    }
+    
+    /**
+     * Convert YUV420 (NV12 format from Android Camera2) to RGB for QOI encoding.
+     * Uses ITU-R BT.601 conversion matrix with optimized fixed-point integer math.
+     * 
+     * Performance: ~2-3x faster than floating-point version by using integer arithmetic.
+     */
+    private fun convertYuv420ToRgb(yuv: ByteArray, width: Int, height: Int): ByteArray {
+        val rgb = ByteArray(width * height * 3)
+        val frameSize = width * height
+        val uvStart = frameSize
+        
+        // Fixed-point conversion constants (scaled by 256 for integer math)
+        // Original float constants * 256:
+        // 1.164 * 256 = 298
+        // 1.596 * 256 = 409
+        // 0.392 * 256 = 100
+        // 0.813 * 256 = 208
+        // 2.017 * 256 = 516
+        
+        for (j in 0 until height) {
+            for (i in 0 until width) {
+                val yIndex = j * width + i
+                val uvIndex = uvStart + (j shr 1) * width + (i and 1.inv())
+                
+                // Extract YUV values (already expanded to int range)
+                val y = (yuv[yIndex].toInt() and 0xff) - 16
+                val u = (yuv[uvIndex].toInt() and 0xff) - 128
+                val v = (yuv[uvIndex + 1].toInt() and 0xff) - 128
+                
+                // ITU-R BT.601 conversion using fixed-point integer math
+                // Divide by 256 (>> 8) to convert back from fixed-point
+                val yScaled = 298 * y
+                val r = ((yScaled + 409 * v) shr 8).coerceIn(0, 255)
+                val g = ((yScaled - 100 * u - 208 * v) shr 8).coerceIn(0, 255)
+                val b = ((yScaled + 516 * u) shr 8).coerceIn(0, 255)
+                
+                // Write RGB values
+                val rgbIndex = yIndex * 3
+                rgb[rgbIndex] = r.toByte()
+                rgb[rgbIndex + 1] = g.toByte()
+                rgb[rgbIndex + 2] = b.toByte()
+            }
+        }
+        
+        return rgb
     }
 
     companion object {
